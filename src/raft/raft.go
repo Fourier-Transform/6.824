@@ -17,14 +17,18 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "sync/atomic"
-import "../labrpc"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"../labrpc"
+)
 
 // import "bytes"
 // import "../labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -43,6 +47,33 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type RaftState int
+type Operation int
+
+const (
+	FOLLOWERSTATE RaftState = iota
+	CANDIDATESTATE
+	LEADERSTATE
+	DEADSTATE
+)
+const (
+	NEWTERM Operation = iota
+	LEGALLEADER
+	UPDATEVOTEDFOR
+	GETVOTE
+	BEDEAD
+)
+const HEARTBEATS_INTERVAL = (400 + 5) * time.Millisecond
+const TIMEOUT_UPPER = 900
+const TIMEOUT_LOWER = 450
+
+var r *rand.Rand
+
+type pair struct {
+	operation   Operation
+	information []int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -56,7 +87,16 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	state           RaftState
+	currentTerm     int
+	votedFor        int
+	votedState      []bool
+	numOfVotedPeers int
+	numOfAllPeers   int
+	dataMu          sync.Mutex
 
+	operateChan chan pair
+	syncChan    chan int
 }
 
 // return currentTerm and whether this server
@@ -66,7 +106,33 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	tmpRaft := rf.copyState()
+
+	term = tmpRaft.currentTerm
+	isleader = tmpRaft.state == LEADERSTATE
 	return term, isleader
+}
+
+func (rf *Raft) copyState() *Raft {
+	rf.dataMu.Lock()
+	defer rf.dataMu.Unlock()
+	res := Raft{}
+	res.me = rf.me
+	res.dead = rf.dead
+
+	res.state = rf.state
+	res.currentTerm = rf.currentTerm
+	res.votedFor = rf.votedFor
+	res.numOfAllPeers = rf.numOfAllPeers
+	res.numOfVotedPeers = rf.numOfVotedPeers
+	res.votedState = make([]bool, res.numOfAllPeers)
+	for i := 0; i < res.numOfAllPeers; i++ {
+		res.votedState[i] = false
+	}
+	return &res
 }
 
 //
@@ -84,7 +150,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -108,15 +173,14 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term        int
+	CandidateId int
 }
 
 //
@@ -125,6 +189,17 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+}
+
+type AppendEntriesReply struct {
+	Term int
 }
 
 //
@@ -132,6 +207,58 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	fmt.Printf("server %v is in RequestVote call by %v\n", rf.me, args.CandidateId)
+	defer fmt.Printf("server %v leaves RequestVote call by %v\n", rf.me, args.CandidateId)
+	tmpRaft := rf.copyState()
+	reply.Term = tmpRaft.currentTerm
+	if args.Term < tmpRaft.currentTerm {
+		return
+	} else if args.Term == tmpRaft.currentTerm {
+		if tmpRaft.votedFor == -1 || tmpRaft.votedFor == args.CandidateId {
+			rf.operateChan <- pair{UPDATEVOTEDFOR, []int{args.Term, args.CandidateId}}
+			rf.syncChan <- 1
+			// 超时之后,follower变成candidate状态,在主程序未作出投票动作
+			// 但是仍然可以在这里投出一票reply.voteGranted=true
+			// 因为主状态的Term与此Term不一致
+			reply.VoteGranted = true
+			// TODO:修改条件
+		} else if tmpRaft.votedFor == args.CandidateId {
+			reply.VoteGranted = true
+		}
+	} else if args.Term > tmpRaft.currentTerm {
+		// 发送者的Term与接受server的Term不一致时
+		// 会导致投票不一致的问题
+		// 也可以只更新term,不进行投票增加复杂度 ->
+		rf.operateChan <- pair{NEWTERM, []int{args.Term}}
+		rf.syncChan <- 1
+		tmpRaft = rf.copyState()
+		if (tmpRaft.votedFor == -1 || tmpRaft.votedFor == args.CandidateId) && args.Term == tmpRaft.currentTerm {
+			rf.operateChan <- pair{UPDATEVOTEDFOR, []int{args.Term, args.CandidateId}}
+			rf.syncChan <- 1
+			reply.VoteGranted = true
+		}
+	}
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	fmt.Printf("server %v is in AppendEntries call by %v\n", rf.me, args.LeaderId)
+	defer fmt.Printf("server %v leaves AppendEntries call by %v\n", rf.me, args.LeaderId)
+	tmpRaft := rf.copyState()
+	reply.Term = tmpRaft.currentTerm
+	if args.Term < tmpRaft.currentTerm {
+		return
+	} else if args.Term == tmpRaft.currentTerm {
+		// here?
+		rf.operateChan <- pair{LEGALLEADER, []int{args.Term, args.LeaderId}}
+		rf.syncChan <- 1
+	} else if args.Term > tmpRaft.currentTerm {
+		rf.operateChan <- pair{NEWTERM, []int{args.Term}}
+		rf.syncChan <- 1
+	}
 }
 
 //
@@ -164,10 +291,78 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if !ok {
+		return false
+	}
+	// fmt.Printf("server %v gets vote from %v\n", rf.me, server)
+	// 在Call之前加锁会导致死锁
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	tmpRaft := rf.copyState()
+	if reply.Term > tmpRaft.currentTerm {
+		rf.operateChan <- pair{NEWTERM, []int{reply.Term}}
+		rf.syncChan <- 1
+	} else if reply.Term == tmpRaft.currentTerm {
+		if reply.VoteGranted {
+			rf.operateChan <- pair{GETVOTE, []int{reply.Term, server}}
+			rf.syncChan <- 1
+		}
+	} else if reply.Term < tmpRaft.currentTerm {
+		rf.operateChan <- pair{GETVOTE, []int{tmpRaft.currentTerm, server}}
+		rf.syncChan <- 1
+	}
 	return ok
 }
 
+func (rf *Raft) sendAllRequestVote() {
+	// fmt.Printf("server %v is in sendAllRequestVote, and len of rf.peers is %v\n", rf.me, len(rf.peers))
+	rf.mu.Lock()
+	args := RequestVoteArgs{
+		Term:        rf.currentTerm,
+		CandidateId: rf.me,
+	}
+	rf.mu.Unlock()
+	for i := range rf.peers {
+		// fmt.Printf("here is server %v, range %v", rf.me, i)
+		if i != rf.me {
+			tmp_i := i
+			// fmt.Printf("server %v gets vote from %v\n", rf.me, tmp_i)
+			go rf.sendRequestVote(tmp_i, &args, &RequestVoteReply{})
+		}
+	}
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if !ok {
+		return false
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	tmpRaft := rf.copyState()
+	if reply.Term > tmpRaft.currentTerm {
+		rf.operateChan <- pair{NEWTERM, []int{reply.Term}}
+		rf.syncChan <- 1
+	}
+	return true
+}
+
+func (rf *Raft) sendAllAppendEntries() {
+	rf.mu.Lock()
+	args := AppendEntriesArgs{
+		Term:     rf.currentTerm,
+		LeaderId: rf.me,
+	}
+	rf.mu.Unlock()
+	for i := range rf.peers {
+		if i != rf.me {
+			tmp_i := i
+			go rf.sendAppendEntries(tmp_i, &args, &AppendEntriesReply{})
+		}
+	}
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -190,7 +385,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
 }
 
@@ -208,6 +402,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.mu.Lock()
+	rf.operateChan <- pair{BEDEAD, []int{0}}
+	rf.syncChan <- 1
+	rf.mu.Unlock()
+
 }
 
 func (rf *Raft) killed() bool {
@@ -234,10 +433,155 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	r = rand.New(rand.NewSource(time.Now().UnixNano() + int64(rf.me)))
+	rf.mu.Lock()
+	rf.state = FOLLOWERSTATE
+	rf.currentTerm = 1
+	rf.votedFor = -1
+	rf.numOfAllPeers = len(peers)
+	rf.numOfVotedPeers = 0
+	rf.votedState = make([]bool, rf.numOfAllPeers)
 
+	rf.operateChan = make(chan pair)
+	rf.syncChan = make(chan int)
+	go rf.MainProcess()
+	rf.mu.Unlock()
+	rf.dataMu.Lock()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-
 	return rf
+}
+
+func (rf *Raft) MainProcess() {
+	for {
+		if rf.state == FOLLOWERSTATE {
+			rf.followerListening()
+		} else if rf.state == CANDIDATESTATE {
+			rf.currentTerm += 1
+			rf.numOfVotedPeers = 1
+			rf.votedFor = rf.me
+			for i := range rf.votedState {
+				rf.votedState[i] = false
+			}
+			go rf.sendAllRequestVote()
+			rf.candidateListening()
+		} else if rf.state == LEADERSTATE {
+			go rf.sendAllAppendEntries()
+			rf.leaderListening()
+		} else if rf.state == DEADSTATE {
+			return
+		}
+	}
+}
+
+func (rf *Raft) followerListening() {
+	fmt.Printf("server %v (Term: %v)is listening as follower\n", rf.me, rf.currentTerm)
+	rf.dataMu.Unlock()
+	select {
+	case <-time.After(GetTimeoutInterval()):
+		rf.dataMu.Lock()
+		rf.state = CANDIDATESTATE
+		return
+	case tmpPair := <-rf.operateChan:
+		rf.dataMu.Lock()
+		op := tmpPair.operation
+		inf := tmpPair.information
+		if inf[0] < rf.currentTerm {
+
+		} else if op == NEWTERM && rf.currentTerm < inf[0] {
+			rf.currentTerm = inf[0]
+			rf.state = FOLLOWERSTATE
+			rf.votedFor = -1
+		} else if op == LEGALLEADER {
+			rf.state = FOLLOWERSTATE
+			fmt.Printf("server %v get heartbeats from server %v\n", rf.me, inf[1])
+		} else if op == UPDATEVOTEDFOR && rf.currentTerm == inf[0] {
+			if rf.votedFor == -1 {
+				rf.votedFor = inf[1]
+			}
+		} else if op == GETVOTE {
+
+		} else if op == BEDEAD {
+			rf.state = DEADSTATE
+		}
+		<-rf.syncChan
+	}
+}
+
+// 只有candidate会单因为超时修改自己状态
+// 所以可能只有candidate要检查收发的信息是否过期了?
+func (rf *Raft) candidateListening() {
+	fmt.Printf("server %v (Term: %v)is listening as candidate\n", rf.me, rf.currentTerm)
+	rf.dataMu.Unlock()
+	select {
+	case <-time.After(GetTimeoutInterval()):
+		rf.dataMu.Lock()
+		rf.state = CANDIDATESTATE
+		return
+	case tmpPair := <-rf.operateChan:
+		rf.dataMu.Lock()
+		op := tmpPair.operation
+		inf := tmpPair.information
+		if inf[0] < rf.currentTerm {
+
+		} else if op == NEWTERM && rf.currentTerm < inf[0] {
+			rf.currentTerm = inf[0]
+			rf.state = FOLLOWERSTATE
+			rf.votedFor = -1
+		} else if op == LEGALLEADER && rf.currentTerm == inf[0] {
+			rf.state = FOLLOWERSTATE
+		} else if op == UPDATEVOTEDFOR {
+
+		} else if op == GETVOTE && rf.currentTerm == inf[0] {
+			//检查是否过期票
+			if !rf.votedState[inf[1]] {
+				rf.votedState[inf[1]] = true
+				rf.numOfVotedPeers++
+				if rf.numOfVotedPeers > rf.numOfAllPeers/2 {
+					rf.state = LEADERSTATE
+				}
+			}
+
+		} else if op == BEDEAD {
+			rf.state = DEADSTATE
+		}
+		<-rf.syncChan
+	}
+}
+
+func (rf *Raft) leaderListening() {
+	fmt.Printf("server %v (Term: %v)is listening as leader\n", rf.me, rf.currentTerm)
+	rf.dataMu.Unlock()
+	select {
+	case <-time.After(HEARTBEATS_INTERVAL):
+		rf.dataMu.Lock()
+		rf.state = LEADERSTATE
+		return
+	case tmpPair := <-rf.operateChan:
+		rf.dataMu.Lock()
+		op := tmpPair.operation
+		inf := tmpPair.information
+		if inf[0] < rf.currentTerm {
+
+		} else if op == NEWTERM && rf.currentTerm < inf[0] {
+			rf.currentTerm = inf[0]
+			rf.state = FOLLOWERSTATE
+			rf.votedFor = -1
+		} else if op == LEGALLEADER && rf.currentTerm == inf[0] {
+			rf.state = FOLLOWERSTATE
+			return
+		} else if op == UPDATEVOTEDFOR {
+
+		} else if op == GETVOTE {
+
+		} else if op == BEDEAD {
+			rf.state = DEADSTATE
+		}
+		<-rf.syncChan
+	}
+}
+
+func GetTimeoutInterval() time.Duration {
+	return time.Duration(r.Intn(TIMEOUT_UPPER-TIMEOUT_LOWER)+TIMEOUT_LOWER) * time.Millisecond
 }
