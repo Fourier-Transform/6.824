@@ -59,9 +59,11 @@ const (
 const (
 	NEWTERM Operation = iota
 	LEGALLEADER
-	UPDATEVOTEDFOR
+	LATERCANDIDATE
+	VOTEFOR
 	GETVOTE
 	BEDEAD
+	UNDIFINE
 )
 const HEARTBEATS_INTERVAL = (400 + 5) * time.Millisecond
 const TIMEOUT_UPPER = 900
@@ -69,9 +71,17 @@ const TIMEOUT_LOWER = 450
 
 var r *rand.Rand
 
-type pair struct {
-	operation   Operation
-	information []int
+type InnerRequest struct {
+	operation Operation
+	term      int
+	extraInf  []int
+}
+
+type InnerResponse struct {
+	success   bool
+	operation Operation
+	term      int
+	extraInf  []int
 }
 
 //
@@ -85,18 +95,23 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
+	rpcMutex   sync.Mutex // 将收到,发出rpc调用完成之后的数据处理串行化 但并发调用rpc
+	stateMutex sync.Mutex // 保护raft状态的读写安全
+
+	state             RaftState
+	currentTerm       int
+	votedFor          int
+	votedStateOfPeers []bool
+	numOfVotedPeers   int
+	numOfAllPeers     int
+	//用于内部数据同步
+	requestChan  chan InnerRequest
+	responseChan chan InnerResponse
+
+	timer *time.Timer
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	state           RaftState
-	currentTerm     int
-	votedFor        int
-	votedState      []bool
-	numOfVotedPeers int
-	numOfAllPeers   int
-	dataMu          sync.Mutex
 
-	operateChan chan pair
-	syncChan    chan int
 }
 
 // return currentTerm and whether this server
@@ -106,33 +121,52 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	// rf.rpcMutex.Lock()
+	// defer rf.rpcMutex.Unlock()
+	// tmp := rf.getCopy()
+	// term = tmp.currentTerm
+	// isleader = tmp.state == LEADERSTATE
+	// defer fmt.Printf("------------------------------%v state is term: %v isLeader: %v\n", tmp.me, term, isleader)
+	// return term, isleader
 
-	tmpRaft := rf.copyState()
-
-	term = tmpRaft.currentTerm
-	isleader = tmpRaft.state == LEADERSTATE
+	// rf.stateMutex.Lock()
+	// defer rf.rpcMutex.Unlock()
+	tmp := rf.getCopy()
+	term = tmp.currentTerm
+	isleader = tmp.state == LEADERSTATE
+	defer fmt.Printf("------------------------------%v state is term: %v isLeader: %v\n", tmp.me, term, isleader)
 	return term, isleader
+	// tmp := rf.getCopy()
+	// term = rf.currentTerm
+	// isleader = rf.state == LEADERSTATE
+	// defer fmt.Printf("------------------------------%v state is term: %v isLeader: %v\n", rf.me, term, isleader)
+	// return term, isleader
 }
 
-func (rf *Raft) copyState() *Raft {
-	rf.dataMu.Lock()
-	defer rf.dataMu.Unlock()
-	res := Raft{}
-	res.me = rf.me
-	res.dead = rf.dead
+func (rf *Raft) getCopy() *Raft {
+	// fmt.Printf("%v lock stateMutex in getCopy\n", rf.me)
+	// defer fmt.Printf("%v unlock stateMutex in getCopy\n", rf.me)
+	rf.stateMutex.Lock()
+	defer rf.stateMutex.Unlock()
+	tmp := Raft{}
+	tmp.me = rf.me
+	tmp.dead = rf.dead
+	tmp.state = rf.state
+	tmp.currentTerm = rf.currentTerm
+	tmp.votedFor = rf.votedFor
+	tmp.numOfAllPeers = rf.numOfAllPeers
+	tmp.numOfVotedPeers = rf.numOfVotedPeers
+	tmp.votedStateOfPeers = make([]bool, tmp.numOfAllPeers)
+	tmp.peers = make([]*labrpc.ClientEnd, tmp.numOfAllPeers)
+	// for i := range tmp.peers {
+	// 	tmp.peers[i] = rf.peers[i]
+	// 	tmp.votedStateOfPeers[i] = rf.votedStateOfPeers[i]
+	// }
+	return &tmp
+}
 
-	res.state = rf.state
-	res.currentTerm = rf.currentTerm
-	res.votedFor = rf.votedFor
-	res.numOfAllPeers = rf.numOfAllPeers
-	res.numOfVotedPeers = rf.numOfVotedPeers
-	res.votedState = make([]bool, res.numOfAllPeers)
-	for i := 0; i < res.numOfAllPeers; i++ {
-		res.votedState[i] = false
-	}
-	return &res
+func GetTimeoutInterval() time.Duration {
+	return time.Duration(r.Intn(TIMEOUT_UPPER-TIMEOUT_LOWER)+TIMEOUT_LOWER) * time.Millisecond
 }
 
 //
@@ -207,57 +241,55 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	fmt.Printf("server %v is in RequestVote call by %v\n", rf.me, args.CandidateId)
-	defer fmt.Printf("server %v leaves RequestVote call by %v\n", rf.me, args.CandidateId)
-	tmpRaft := rf.copyState()
-	reply.Term = tmpRaft.currentTerm
-	if args.Term < tmpRaft.currentTerm {
+	rf.rpcMutex.Lock()
+	defer rf.rpcMutex.Unlock()
+
+	tmp := rf.getCopy()
+	fmt.Printf("%v (%v) handle RequestVote from %v\n", rf.me, tmp.currentTerm, args.CandidateId)
+	reply.Term = tmp.currentTerm
+	if tmp.currentTerm > args.Term {
 		return
-	} else if args.Term == tmpRaft.currentTerm {
-		if tmpRaft.votedFor == -1 || tmpRaft.votedFor == args.CandidateId {
-			rf.operateChan <- pair{UPDATEVOTEDFOR, []int{args.Term, args.CandidateId}}
-			rf.syncChan <- 1
-			// 超时之后,follower变成candidate状态,在主程序未作出投票动作
-			// 但是仍然可以在这里投出一票reply.voteGranted=true
-			// 因为主状态的Term与此Term不一致
-			reply.VoteGranted = true
-			// TODO:修改条件
-		} else if tmpRaft.votedFor == args.CandidateId {
-			reply.VoteGranted = true
-		}
-	} else if args.Term > tmpRaft.currentTerm {
-		// 发送者的Term与接受server的Term不一致时
-		// 会导致投票不一致的问题
-		// 也可以只更新term,不进行投票增加复杂度 ->
-		rf.operateChan <- pair{NEWTERM, []int{args.Term}}
-		rf.syncChan <- 1
-		tmpRaft = rf.copyState()
-		if (tmpRaft.votedFor == -1 || tmpRaft.votedFor == args.CandidateId) && args.Term == tmpRaft.currentTerm {
-			rf.operateChan <- pair{UPDATEVOTEDFOR, []int{args.Term, args.CandidateId}}
-			rf.syncChan <- 1
-			reply.VoteGranted = true
+	} else {
+		if tmp.currentTerm < args.Term {
+			rf.requestChan <- InnerRequest{LATERCANDIDATE, args.Term, []int{args.Term, args.CandidateId}}
+			ans := <-rf.responseChan
+			if ans.success {
+				reply.VoteGranted = true
+			} else {
+				reply.VoteGranted = false
+			}
+		} else if tmp.currentTerm == args.Term {
+			rf.requestChan <- InnerRequest{VOTEFOR, args.Term, []int{args.Term, args.CandidateId}}
+			ans := <-rf.responseChan
+			if ans.success {
+				reply.VoteGranted = true
+			} else {
+				reply.VoteGranted = false
+			}
 		}
 	}
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	fmt.Printf("server %v is in AppendEntries call by %v\n", rf.me, args.LeaderId)
-	defer fmt.Printf("server %v leaves AppendEntries call by %v\n", rf.me, args.LeaderId)
-	tmpRaft := rf.copyState()
-	reply.Term = tmpRaft.currentTerm
-	if args.Term < tmpRaft.currentTerm {
+	rf.rpcMutex.Lock()
+	defer rf.rpcMutex.Unlock()
+
+	tmp := rf.getCopy()
+	fmt.Printf("%v (%v) handle AppendEntries from %v\n", tmp.me, tmp.currentTerm, args.LeaderId)
+	reply.Term = tmp.currentTerm
+	if tmp.currentTerm > args.Term {
+		fmt.Printf("%v !!here is 1\n", rf.me)
 		return
-	} else if args.Term == tmpRaft.currentTerm {
-		// here?
-		rf.operateChan <- pair{LEGALLEADER, []int{args.Term, args.LeaderId}}
-		rf.syncChan <- 1
-	} else if args.Term > tmpRaft.currentTerm {
-		rf.operateChan <- pair{NEWTERM, []int{args.Term}}
-		rf.syncChan <- 1
+	} else {
+		if tmp.currentTerm < args.Term {
+			fmt.Printf("%v !!here is 2\n", rf.me)
+			rf.requestChan <- InnerRequest{NEWTERM, args.Term, []int{args.Term}}
+			<-rf.responseChan
+		} else if tmp.currentTerm == args.Term {
+			fmt.Printf("%v !!here is 3\n", rf.me)
+			rf.requestChan <- InnerRequest{LEGALLEADER, args.Term, []int{args.Term, args.LeaderId}}
+			<-rf.responseChan
+		}
 	}
 }
 
@@ -291,76 +323,91 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	if !ok {
-		return false
+	// fmt.Printf("%v (%v)send RequestVote to %v\n", rf.me, args.Term, server)
+	if ok {
+		rf.RequestVoteReplyHandle(server, args, reply)
 	}
-	// fmt.Printf("server %v gets vote from %v\n", rf.me, server)
-	// 在Call之前加锁会导致死锁
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	tmpRaft := rf.copyState()
-	if reply.Term > tmpRaft.currentTerm {
-		rf.operateChan <- pair{NEWTERM, []int{reply.Term}}
-		rf.syncChan <- 1
-	} else if reply.Term == tmpRaft.currentTerm {
-		if reply.VoteGranted {
-			rf.operateChan <- pair{GETVOTE, []int{reply.Term, server}}
-			rf.syncChan <- 1
-		}
-	} else if reply.Term < tmpRaft.currentTerm {
-		rf.operateChan <- pair{GETVOTE, []int{tmpRaft.currentTerm, server}}
-		rf.syncChan <- 1
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	fmt.Printf("%v (%v) sends AppendEntries to %v\n", args.LeaderId, args.Term, server)
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if ok {
+		fmt.Printf("%v (%v) before \n", args.LeaderId, args.Term)
+		rf.AppendEntriesReplyHandle(server, args, reply)
 	}
 	return ok
 }
 
 func (rf *Raft) sendAllRequestVote() {
-	// fmt.Printf("server %v is in sendAllRequestVote, and len of rf.peers is %v\n", rf.me, len(rf.peers))
-	rf.mu.Lock()
+	// rf.stateMutex.Lock()
+	tmp := rf.getCopy()
+	// rf.stateMutex.Unlock()
 	args := RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateId: rf.me,
+		Term:        tmp.currentTerm,
+		CandidateId: tmp.me,
 	}
-	rf.mu.Unlock()
-	for i := range rf.peers {
-		// fmt.Printf("here is server %v, range %v", rf.me, i)
-		if i != rf.me {
+
+	for i := range tmp.peers {
+		if i != rf.me && !tmp.votedStateOfPeers[i] {
+			// 记得这里是go的坑点?
 			tmp_i := i
-			// fmt.Printf("server %v gets vote from %v\n", rf.me, tmp_i)
 			go rf.sendRequestVote(tmp_i, &args, &RequestVoteReply{})
 		}
 	}
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if !ok {
-		return false
-	}
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	tmpRaft := rf.copyState()
-	if reply.Term > tmpRaft.currentTerm {
-		rf.operateChan <- pair{NEWTERM, []int{reply.Term}}
-		rf.syncChan <- 1
-	}
-	return true
-}
-
 func (rf *Raft) sendAllAppendEntries() {
-	rf.mu.Lock()
+	// rf.stateMutex.Lock()
+	tmp := rf.getCopy()
+	// rf.stateMutex.Unlock()
 	args := AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
+		Term:     tmp.currentTerm,
+		LeaderId: tmp.me,
 	}
-	rf.mu.Unlock()
-	for i := range rf.peers {
+	for i := range tmp.peers {
 		if i != rf.me {
 			tmp_i := i
 			go rf.sendAppendEntries(tmp_i, &args, &AppendEntriesReply{})
 		}
+	}
+}
+
+func (rf *Raft) RequestVoteReplyHandle(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.rpcMutex.Lock()
+	defer rf.rpcMutex.Unlock()
+	tmp := rf.getCopy()
+	fmt.Printf("%v (%v)handle RequestVoteReply from %v\n", tmp.me, tmp.currentTerm, server)
+	if args.Term < reply.Term {
+		if tmp.currentTerm < reply.Term {
+			// NEWTERM
+			fmt.Printf("server %v in RequestVoteReplyHandle\n", tmp.me)
+			rf.requestChan <- InnerRequest{NEWTERM, reply.Term, []int{reply.Term}}
+			<-rf.responseChan
+		}
+		// 当args.Term >= reply.Term时才有投票效果
+	} else if args.Term >= reply.Term {
+		// 只有args.Term == tmp.currentTerm 该请求才是对应该阶段的投票
+		if tmp.currentTerm == args.Term && rf.state == CANDIDATESTATE {
+			rf.requestChan <- InnerRequest{GETVOTE, tmp.currentTerm, []int{tmp.currentTerm, server}}
+			<-rf.responseChan
+		}
+	}
+}
+
+func (rf *Raft) AppendEntriesReplyHandle(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.rpcMutex.Lock()
+	defer rf.rpcMutex.Unlock()
+	tmp := rf.getCopy()
+	if args.Term < reply.Term {
+		if tmp.currentTerm < reply.Term {
+			rf.requestChan <- InnerRequest{NEWTERM, reply.Term, []int{reply.Term}}
+			<-rf.responseChan
+		}
+	} else {
+		// lab2A中 AppendEntriesReply除了传递Term无其他作用
 	}
 }
 
@@ -402,12 +449,29 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.mu.Lock()
-	rf.operateChan <- pair{BEDEAD, []int{0}}
-	rf.syncChan <- 1
-	rf.mu.Unlock()
-
+	// fmt.Printf("---------Kill is called -------------------%v\n", rf.me)
+	// defer fmt.Printf("---------leave kill -------------------%v\n", rf.me)
+	rf.rpcMutex.Lock()
+	defer rf.rpcMutex.Unlock()
+	// rf.stateMutex.Lock()
+	// defer rf.stateMutex.Unlock()
+	// rf.state = DEADSTATE
+	// fmt.Printf("1111111111111111111111111111111111111111111111111\n")
+	rf.requestChan <- InnerRequest{BEDEAD, 2147483647, []int{}}
+	// fmt.Printf("2222222222222222222222222222222222222222222222222\n")
+	<-rf.responseChan
+	// fmt.Printf("333333333333333333333333333333333333333333333333\n")
 }
+
+// func (rf *Raft) Kill() {
+// 	atomic.StoreInt32(&rf.dead, 1)
+// 	// Your code here, if desired.
+// 	rf.mu.Lock()
+// 	rf.operateChan <- pair{BEDEAD, []int{0}}
+// 	rf.syncChan <- 1
+// 	rf.mu.Unlock()
+
+// }
 
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
@@ -433,20 +497,32 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	// state             RaftState
+	// currentTerm       int
+	// votedFor          int
+	// votedStateOfPeers []bool
+	// numOfVotedPeers   int
+	// numOfAllPeers     int
+	// //用于内部数据同步
+	// requestChan  chan InnerRequest
+	// responseChan chan InnerResponse
 	r = rand.New(rand.NewSource(time.Now().UnixNano() + int64(rf.me)))
-	rf.mu.Lock()
+	rf.timer = time.NewTimer(GetTimeoutInterval())
+	if !rf.timer.Stop() {
+		<-rf.timer.C
+	}
 	rf.state = FOLLOWERSTATE
 	rf.currentTerm = 1
 	rf.votedFor = -1
 	rf.numOfAllPeers = len(peers)
 	rf.numOfVotedPeers = 0
-	rf.votedState = make([]bool, rf.numOfAllPeers)
+	rf.votedStateOfPeers = make([]bool, rf.numOfAllPeers)
 
-	rf.operateChan = make(chan pair)
-	rf.syncChan = make(chan int)
+	rf.requestChan = make(chan InnerRequest)
+	rf.responseChan = make(chan InnerResponse)
 	go rf.MainProcess()
-	rf.mu.Unlock()
-	rf.dataMu.Lock()
+
+	rf.stateMutex.Lock()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
@@ -454,134 +530,321 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) MainProcess() {
+	fmt.Printf("%v is created\n", rf.me)
 	for {
-		if rf.state == FOLLOWERSTATE {
-			rf.followerListening()
-		} else if rf.state == CANDIDATESTATE {
+		switch rf.state {
+		case FOLLOWERSTATE:
+			rf.FollowerProcess()
+		case CANDIDATESTATE:
 			rf.currentTerm += 1
-			rf.numOfVotedPeers = 1
 			rf.votedFor = rf.me
-			for i := range rf.votedState {
-				rf.votedState[i] = false
-			}
-			go rf.sendAllRequestVote()
-			rf.candidateListening()
-		} else if rf.state == LEADERSTATE {
-			go rf.sendAllAppendEntries()
-			rf.leaderListening()
-		} else if rf.state == DEADSTATE {
-			return
-		}
-	}
-}
-
-func (rf *Raft) followerListening() {
-	fmt.Printf("server %v (Term: %v)is listening as follower\n", rf.me, rf.currentTerm)
-	rf.dataMu.Unlock()
-	select {
-	case <-time.After(GetTimeoutInterval()):
-		rf.dataMu.Lock()
-		rf.state = CANDIDATESTATE
-		return
-	case tmpPair := <-rf.operateChan:
-		rf.dataMu.Lock()
-		op := tmpPair.operation
-		inf := tmpPair.information
-		if inf[0] < rf.currentTerm {
-
-		} else if op == NEWTERM && rf.currentTerm < inf[0] {
-			rf.currentTerm = inf[0]
-			rf.state = FOLLOWERSTATE
-			rf.votedFor = -1
-		} else if op == LEGALLEADER {
-			rf.state = FOLLOWERSTATE
-			fmt.Printf("server %v get heartbeats from server %v\n", rf.me, inf[1])
-		} else if op == UPDATEVOTEDFOR && rf.currentTerm == inf[0] {
-			if rf.votedFor == -1 {
-				rf.votedFor = inf[1]
-			}
-		} else if op == GETVOTE {
-
-		} else if op == BEDEAD {
-			rf.state = DEADSTATE
-		}
-		<-rf.syncChan
-	}
-}
-
-// 只有candidate会单因为超时修改自己状态
-// 所以可能只有candidate要检查收发的信息是否过期了?
-func (rf *Raft) candidateListening() {
-	fmt.Printf("server %v (Term: %v)is listening as candidate\n", rf.me, rf.currentTerm)
-	rf.dataMu.Unlock()
-	select {
-	case <-time.After(GetTimeoutInterval()):
-		rf.dataMu.Lock()
-		rf.state = CANDIDATESTATE
-		return
-	case tmpPair := <-rf.operateChan:
-		rf.dataMu.Lock()
-		op := tmpPair.operation
-		inf := tmpPair.information
-		if inf[0] < rf.currentTerm {
-
-		} else if op == NEWTERM && rf.currentTerm < inf[0] {
-			rf.currentTerm = inf[0]
-			rf.state = FOLLOWERSTATE
-			rf.votedFor = -1
-		} else if op == LEGALLEADER && rf.currentTerm == inf[0] {
-			rf.state = FOLLOWERSTATE
-		} else if op == UPDATEVOTEDFOR {
-
-		} else if op == GETVOTE && rf.currentTerm == inf[0] {
-			//检查是否过期票
-			if !rf.votedState[inf[1]] {
-				rf.votedState[inf[1]] = true
-				rf.numOfVotedPeers++
-				if rf.numOfVotedPeers > rf.numOfAllPeers/2 {
-					rf.state = LEADERSTATE
+			rf.numOfVotedPeers = 1
+			for i := range rf.peers {
+				if i != rf.me {
+					rf.votedStateOfPeers[i] = false
 				}
 			}
-
-		} else if op == BEDEAD {
-			rf.state = DEADSTATE
-		}
-		<-rf.syncChan
-	}
-}
-
-func (rf *Raft) leaderListening() {
-	fmt.Printf("server %v (Term: %v)is listening as leader\n", rf.me, rf.currentTerm)
-	rf.dataMu.Unlock()
-	select {
-	case <-time.After(HEARTBEATS_INTERVAL):
-		rf.dataMu.Lock()
-		rf.state = LEADERSTATE
-		return
-	case tmpPair := <-rf.operateChan:
-		rf.dataMu.Lock()
-		op := tmpPair.operation
-		inf := tmpPair.information
-		if inf[0] < rf.currentTerm {
-
-		} else if op == NEWTERM && rf.currentTerm < inf[0] {
-			rf.currentTerm = inf[0]
-			rf.state = FOLLOWERSTATE
-			rf.votedFor = -1
-		} else if op == LEGALLEADER && rf.currentTerm == inf[0] {
-			rf.state = FOLLOWERSTATE
+			rf.CandidateProcess()
+		case LEADERSTATE:
+			// fmt.Printf("%v (%v) comes here 1\n", rf.me, rf.currentTerm)
+			rf.LeaderProcess()
+		case DEADSTATE:
 			return
-		} else if op == UPDATEVOTEDFOR {
-
-		} else if op == GETVOTE {
-
-		} else if op == BEDEAD {
-			rf.state = DEADSTATE
 		}
-		<-rf.syncChan
 	}
 }
 
-func GetTimeoutInterval() time.Duration {
-	return time.Duration(r.Intn(TIMEOUT_UPPER-TIMEOUT_LOWER)+TIMEOUT_LOWER) * time.Millisecond
+// 只有candidate会收到过时数据
+// 因为在不接收外部消息时,只有follower会变成candidate,以及candidate超时currentTerm++
+func (rf *Raft) FollowerProcess() {
+	fmt.Printf("%v (%v) goes FollowerProcess\n", rf.me, rf.currentTerm)
+	rf.timer.Reset(GetTimeoutInterval())
+	// fmt.Printf("%v (%v) comes here4\n", rf.me, rf.currentTerm)
+	for {
+		// fmt.Printf("%v unlock stateMutex in followerProcess\n", rf.me)
+		// fmt.Printf("%v (%v) comes here5\n", rf.me, rf.currentTerm)
+		rf.stateMutex.Unlock()
+
+		select {
+		case <-rf.timer.C:
+			// fmt.Printf("%v lock stateMutex in followerProcess\n", rf.me)
+			// fmt.Printf("%v (%v) comes here2\n", rf.me, rf.currentTerm)
+			rf.stateMutex.Lock()
+			rf.state = CANDIDATESTATE
+			// fmt.Printf("%v timeout\n", rf.me)
+			return
+		case tmp := <-rf.requestChan:
+			// fmt.Printf("%v (%v) comes here3\n", rf.me, rf.currentTerm)
+			// fmt.Printf("%v (%v) comes here xxxxxxx\n", rf.me, rf.currentTerm)
+			rf.stateMutex.Lock()
+			operation := tmp.operation
+			term := tmp.term
+			extraInf := tmp.extraInf
+			if term < rf.currentTerm {
+				// 接收时是不可能事件
+				// 主动发送后的回复处理是可能出现的
+				// fmt.Printf("不可能事件\n")
+				rf.responseChan <- InnerResponse{false, UNDIFINE, rf.currentTerm, []int{}}
+				continue
+			}
+
+			switch operation {
+			case NEWTERM:
+				// fmt.Printf("%v %v (%v) in NEWTERM", rf.currentTerm, rf.me, rf.currentTerm)
+				if term <= rf.currentTerm {
+					rf.responseChan <- InnerResponse{false, UNDIFINE, rf.currentTerm, []int{}}
+					continue
+				} else {
+					if !rf.timer.Stop() {
+						<-rf.timer.C
+					}
+					rf.state = FOLLOWERSTATE
+					rf.currentTerm = extraInf[0]
+					rf.votedFor = -1
+					rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+					return
+				}
+			case LEGALLEADER:
+				// fmt.Printf("%v %v (%v) in LEAGALLEADER\n", rf.currentTerm, rf.me, rf.currentTerm)
+				if !rf.timer.Stop() {
+					<-rf.timer.C
+				}
+				rf.state = FOLLOWERSTATE
+				rf.currentTerm = extraInf[0]
+				rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+				return
+			case LATERCANDIDATE:
+				// fmt.Printf("%v %v (%v) in LATERCANDIDATE\n", rf.currentTerm, rf.me, rf.currentTerm)
+				if !rf.timer.Stop() {
+					<-rf.timer.C
+				}
+				rf.state = FOLLOWERSTATE
+				rf.currentTerm = extraInf[0]
+				rf.votedFor = extraInf[1]
+				rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+				return
+			case VOTEFOR:
+				// 有必要重新检查吗?->没必要
+				// 1. Term是恒久增长的
+				// 2. 处理时可能使用的Term <= currentTerm
+				// 3. 小于的Term被之前丢弃
+				// 4. ->只能等于
+				// 投票后重新计时吗->要
+				// fmt.Printf("%v %v (%v) in VOTEFOR\n", rf.currentTerm, rf.me, rf.currentTerm)
+				if !rf.timer.Stop() {
+					<-rf.timer.C
+				}
+				rf.state = FOLLOWERSTATE
+				// 重新检查?
+				if rf.votedFor == -1 {
+					rf.votedFor = extraInf[0]
+					rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+				} else {
+					rf.responseChan <- InnerResponse{false, UNDIFINE, rf.currentTerm, []int{}}
+				}
+				return
+			case GETVOTE:
+				// fmt.Printf("%v %v (%v) in GETVOTE\n", rf.currentTerm, rf.me, rf.currentTerm)
+				rf.responseChan <- InnerResponse{false, UNDIFINE, rf.currentTerm, []int{}}
+				continue
+			case BEDEAD:
+				// fmt.Printf("%v %v (%v) in BEDEAD\n", rf.currentTerm, rf.me, rf.currentTerm)
+				rf.state = DEADSTATE
+				rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+				if !rf.timer.Stop() {
+					<-rf.timer.C
+				}
+				return
+			}
+		}
+		// fmt.Printf("%v (%v) comes here 6\n", rf.me, rf.currentTerm)
+	}
+}
+
+//candidate 要设置多个计时器
+// 在一个Term内发送多次请求吗?√
+func (rf *Raft) CandidateProcess() {
+	fmt.Printf("%v (%v) goes CandidateProcess\n", rf.me, rf.currentTerm)
+	tmpTimer := time.NewTimer(HEARTBEATS_INTERVAL)
+	rf.timer.Reset(GetTimeoutInterval())
+	go rf.sendAllRequestVote()
+	for {
+		// fmt.Printf("%v unlock stateMutex in CandidateProcess\n", rf.me)
+		rf.stateMutex.Unlock()
+		select {
+		case <-rf.timer.C:
+			fmt.Printf("%v here is rf.timer.C\n", rf.me)
+			rf.stateMutex.Lock()
+			rf.state = CANDIDATESTATE
+			return
+		case <-tmpTimer.C:
+			fmt.Printf("%v here is tmpTimer.C\n", rf.me)
+			rf.stateMutex.Lock()
+			tmpTimer.Reset(GetTimeoutInterval())
+			go rf.sendAllRequestVote()
+			continue
+		case tmp := <-rf.requestChan:
+			fmt.Printf("%v here is rf.requestChan\n", rf.me)
+			rf.stateMutex.Lock()
+			operation := tmp.operation
+			term := tmp.term
+			extraInf := tmp.extraInf
+			if term < rf.currentTerm {
+				// 接收时是不可能事件
+				// 主动发送后的回复处理是可能出现的
+				rf.responseChan <- InnerResponse{false, UNDIFINE, rf.currentTerm, []int{}}
+				// fmt.Printf("不可能事件\n")
+				continue
+			}
+			switch operation {
+			case NEWTERM:
+				if term <= rf.currentTerm {
+					rf.responseChan <- InnerResponse{false, UNDIFINE, rf.currentTerm, []int{}}
+					continue
+				} else {
+					if !rf.timer.Stop() {
+						<-rf.timer.C
+					}
+					rf.state = FOLLOWERSTATE
+					rf.currentTerm = extraInf[0]
+					rf.votedFor = -1
+					rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+					return
+				}
+			case LEGALLEADER:
+				if !rf.timer.Stop() {
+					<-rf.timer.C
+				}
+				rf.state = FOLLOWERSTATE
+				rf.currentTerm = extraInf[0]
+				rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+				return
+			case LATERCANDIDATE:
+				if !rf.timer.Stop() {
+					<-rf.timer.C
+				}
+				rf.state = FOLLOWERSTATE
+				rf.currentTerm = extraInf[0]
+				rf.votedFor = extraInf[1]
+				rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+				return
+			case VOTEFOR:
+				rf.responseChan <- InnerResponse{false, UNDIFINE, rf.currentTerm, []int{}}
+				continue
+			case GETVOTE:
+				// TODO:检查重复获票 √
+				if !rf.votedStateOfPeers[extraInf[1]] {
+					rf.numOfVotedPeers += 1
+					rf.votedStateOfPeers[extraInf[1]] = true
+					if rf.numOfVotedPeers > rf.numOfAllPeers/2 {
+						if !rf.timer.Stop() {
+							<-rf.timer.C
+						}
+						rf.state = LEADERSTATE
+						rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+						return
+					} else {
+						continue
+					}
+				} else {
+					continue
+				}
+
+			case BEDEAD:
+				rf.state = DEADSTATE
+				rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+				if !rf.timer.Stop() {
+					<-rf.timer.C
+				}
+				return
+			}
+		}
+	}
+}
+
+func (rf *Raft) LeaderProcess() {
+	fmt.Printf("%v (%v) goes LeaderProcess\n", rf.me, rf.currentTerm)
+	rf.timer.Reset(HEARTBEATS_INTERVAL)
+	go rf.sendAllAppendEntries()
+	for {
+		rf.stateMutex.Unlock()
+		select {
+		case <-rf.timer.C:
+			rf.stateMutex.Lock()
+			rf.state = LEADERSTATE
+			return
+		case tmp := <-rf.requestChan:
+			rf.stateMutex.Lock()
+			operation := tmp.operation
+			term := tmp.term
+			extraInf := tmp.extraInf
+			if term < rf.currentTerm {
+				// 接收时是不可能事件
+				// 主动发送后的回复处理是可能出现的
+				rf.responseChan <- InnerResponse{false, UNDIFINE, rf.currentTerm, []int{}}
+				// fmt.Printf("不可能事件\n")
+				continue
+			}
+			switch operation {
+			case NEWTERM:
+				if term <= rf.currentTerm {
+					rf.responseChan <- InnerResponse{false, UNDIFINE, rf.currentTerm, []int{}}
+					continue
+				} else {
+					if !rf.timer.Stop() {
+						<-rf.timer.C
+					}
+					rf.state = FOLLOWERSTATE
+					fmt.Printf("%v server", rf.me)
+					rf.currentTerm = extraInf[0]
+					rf.votedFor = -1
+					rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+					return
+				}
+				// Leader以及Follower使用以下被注释代码就可行
+				// 因为handle函数是串行执行的,在执行handle函数时,raft的状态有且仅有follower和candidate超时事件能改变
+				// 而该超时事件将raft变为candidate
+				// !!!!!!所以follower和leader无需检查传入的tmp.Term是否过期!!!!!!!
+				// !!!
+				// if !rf.timer.Stop() {
+				// 	<-rf.timer.C
+				// }
+				// rf.state = FOLLOWERSTATE
+				// rf.currentTerm = extraInf[0]
+				// rf.votedFor = -1
+				// rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+				// return
+			case LEGALLEADER:
+				if !rf.timer.Stop() {
+					<-rf.timer.C
+				}
+				rf.state = FOLLOWERSTATE
+				rf.currentTerm = extraInf[0]
+				rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+				return
+			case LATERCANDIDATE:
+				if !rf.timer.Stop() {
+					<-rf.timer.C
+				}
+				rf.state = FOLLOWERSTATE
+				rf.currentTerm = extraInf[0]
+				rf.votedFor = extraInf[1]
+				rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+				return
+			case VOTEFOR:
+				rf.responseChan <- InnerResponse{false, UNDIFINE, rf.currentTerm, []int{}}
+				continue
+			case GETVOTE:
+				rf.responseChan <- InnerResponse{false, UNDIFINE, rf.currentTerm, []int{}}
+				continue
+			case BEDEAD:
+				rf.state = DEADSTATE
+				rf.responseChan <- InnerResponse{true, UNDIFINE, rf.currentTerm, []int{}}
+				if !rf.timer.Stop() {
+					<-rf.timer.C
+				}
+				return
+			}
+		}
+	}
 }
